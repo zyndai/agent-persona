@@ -570,9 +570,7 @@ def get_persona_status(user_id: str) -> dict:
         "profile": persona.get("profile", {}),
         "webhook_url": persona["webhook_url"],
         "public_key": persona["public_key"],
-        "brief_doc_id": persona.get("brief_doc_id"),
-        "brief_doc_url": persona.get("brief_doc_url"),
-        "brief_doc_revision_id": persona.get("brief_doc_revision_id"),
+        "brief_content": persona.get("brief_content"),
     }
 
 def update_persona_profile(user_id: str, updates: dict) -> dict:
@@ -610,126 +608,110 @@ def get_persona_by_agent_id(agent_id: str) -> dict | None:
     result = sb.table("persona_agents").select("*").eq("agent_id", agent_id).eq("active", True).execute()
     return result.data[0] if result.data else None
 
-# ── Brief Google Doc lifecycle ───────────────────────────────────────
+# ── Brief (plain text) ───────────────────────────────────────────────
 #
-# The Brief is the agent's long-form context about its principal. It lives
-# as a Google Doc the agent created (so we have access under drive.file
-# scope and the user retains ownership). The doc_id and url are stored on
-# the persona row so we can fetch the live content on every chat turn
-# instead of duplicating it in our DB.
+# The Brief is the agent's long-form context about its principal. It is a
+# plain-text field on persona_agents.brief_content (no Google Doc). This is
+# the single source of truth the orchestrator reads on every chat turn.
 
 def init_brief_doc(user_id: str) -> dict:
-    """
-    Create the persona's Brief Google Doc if it doesn't exist yet.
+    """Legacy shim. The brief is a text field now — nothing to create.
 
-    Returns the brief info dict {doc_id, url, created (bool)}. Safe to call
-    repeatedly — second call just returns the existing doc.
-
-    Raises ValueError if the user has no active persona or hasn't connected
-    Google.
+    Returns the current brief state so existing callers (the old /brief/init
+    endpoint, MCP _ensure_brief_doc) behave as a read instead of a Google call.
     """
     persona = get_persona_status(user_id)
     if not persona.get("deployed"):
-        raise ValueError("No active persona — create a persona before initializing a brief.")
+        raise ValueError("No active persona — create a persona before using the brief.")
+    return {
+        "doc_id": None,
+        "url": "",
+        "created": False,
+        "exists": True,
+        "content": (persona.get("brief_content") or "").strip(),
+    }
 
-    if persona.get("brief_doc_id"):
-        return {
-            "doc_id": persona["brief_doc_id"],
-            "url": persona.get("brief_doc_url") or "",
-            "created": False,
-        }
+def get_brief(user_id: str) -> dict:
+    """Return the persona's brief text (single source of truth: persona_agents.brief_content).
 
-    # Lazy import to keep persona_manager importable in environments
-    # that don't have google-api-client installed yet.
-    from mcp.tools.google.docs import create_document, append_to_document
+    The brief is now a plain text field, not a Google Doc. `exists` is True
+    whenever the persona is deployed (the field always exists; it may be empty).
+    """
+    persona = get_persona_status(user_id)
+    if not persona.get("deployed"):
+        raise ValueError("No active persona.")
 
-    principal_name = persona.get("name") or "Your"
-    title = f"Brief — {principal_name}"
-    result = create_document(user_id=user_id, title=title)
-    if not result.get("success"):
-        raise ValueError(f"Failed to create brief doc: {result.get('error')}")
+    content = (persona.get("brief_content") or "").strip()
+    return {
+        "exists": True,
+        "content": content,
+        "fallback_description": persona.get("description") or "",
+    }
 
-    doc_id = result["document_id"]
-    doc_url = result["link"]
+def _seed_brief_to_memory(user_id: str, content: str) -> None:
+    """Best-effort: ingest the brief text into the memory layer so its
+    substance becomes semantically recallable (Phase 5).
 
-    # Seed the doc with the existing persona.description so the user starts
-    # with their current short-form brief instead of an empty page.
-    seed = (persona.get("description") or "").strip()
-    if seed:
-        append_to_document(user_id=user_id, document_id=doc_id, text=seed + "\n")
+    The brief's narrative stays verbatim in the system prompt; this makes the
+    same text extractable as facts for `what_do_you_know_about_me` / topic
+    recall. Fire-and-forget — never blocks the save, never raises. Idempotent
+    by content hash: an unchanged brief collides in the memory layer and is
+    skipped.
+    """
+    from agent.memory_client import ingest_turns, is_enabled
+
+    if not is_enabled():
+        return
+    text = (content or "").strip()
+    if len(text) < 40:  # below the memory layer's min-chunk floor, no signal
+        return
+
+    async def _run() -> None:
+        try:
+            await ingest_turns(
+                user_id=user_id,
+                turns=[{"role": "user", "content": text}],
+                source_system="brief_seeded",
+            )
+        except Exception as e:  # noqa: BLE001 — memory seeding must never break the save
+            logger.debug("[persona] brief→memory seed failed for %s: %s", user_id, e)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None:
+        # Called on the event-loop thread (e.g. api/persona.py save_brief).
+        loop.create_task(_run())
+    else:
+        # Called from a worker thread (MCP tools run via asyncio.to_thread).
+        import threading
+
+        def _runner() -> None:
+            try:
+                asyncio.run(_run())
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[persona] brief→memory seed failed for %s: %s", user_id, e)
+
+        threading.Thread(target=_runner, daemon=True).start()
+
+
+def save_brief_content(user_id: str, content: str) -> dict:
+    """Store the persona's brief body as plain text on persona_agents.brief_content."""
+    persona = get_persona_status(user_id)
+    if not persona.get("deployed"):
+        raise ValueError("No active persona.")
 
     sb = _get_supabase()
     sb.table("persona_agents").update({
-        "brief_doc_id": doc_id,
-        "brief_doc_url": doc_url,
+        "brief_content": content or None,
     }).eq("user_id", user_id).execute()
 
-    logger.info(f"[persona] Initialized brief doc for {user_id}: {doc_id}")
-    return {"doc_id": doc_id, "url": doc_url, "created": True}
+    _seed_brief_to_memory(user_id, content)
 
-def get_brief(user_id: str) -> dict:
-    """
-    Return the persona's brief — both metadata (doc_id, url) and current
-    plain-text content fetched live from Google Docs.
-
-    Returns {doc_id, url, content, exists (bool)}. If no brief doc has
-    been initialized, returns {exists: False, fallback_description}.
-    """
-    persona = get_persona_status(user_id)
-    if not persona.get("deployed"):
-        raise ValueError("No active persona.")
-
-    doc_id = persona.get("brief_doc_id")
-    if not doc_id:
-        return {
-            "exists": False,
-            "fallback_description": persona.get("description") or "",
-        }
-
-    from mcp.tools.google.docs import read_document
-    fetched = read_document(user_id=user_id, document_id=doc_id)
-    if not fetched.get("success"):
-        # Doc was deleted out from under us, or Google returned an error.
-        # Surface that to the UI so the user can re-init.
-        return {
-            "exists": True,
-            "doc_id": doc_id,
-            "url": persona.get("brief_doc_url") or "",
-            "content": "",
-            "error": fetched.get("error"),
-        }
-
-    return {
-        "exists": True,
-        "doc_id": doc_id,
-        "url": persona.get("brief_doc_url") or "",
-        "content": fetched.get("content") or "",
-        "title": fetched.get("title"),
-    }
-
-def save_brief_content(user_id: str, content: str) -> dict:
-    """Replace the body of the persona's brief Google Doc with `content`."""
-    persona = get_persona_status(user_id)
-    if not persona.get("deployed"):
-        raise ValueError("No active persona.")
-    doc_id = persona.get("brief_doc_id")
-    if not doc_id:
-        raise ValueError("No brief doc to save into — initialize it first.")
-
-    from mcp.tools.google.docs import replace_document_body
-    result = replace_document_body(user_id=user_id, document_id=doc_id, text=content)
-    if not result.get("success"):
-        return {"success": False, "error": result.get("error")}
-
-    try:
-        sb = _get_supabase()
-        sb.table("persona_agents").update({
-            "brief_content": content or None,
-        }).eq("user_id", user_id).execute()
-    except Exception as e:
-        logger.warning(f"[persona] brief_content DB sync failed (non-fatal): {e}")
-
-    return {"success": True, "doc_id": doc_id, "content": content}
+    logger.info(f"[persona] saved brief for {user_id} ({len(content or '')} chars)")
+    return {"success": True, "content": content}
 
 def _migrate_stale_webhook_url(persona: dict, developer_seed: bytes) -> None:
     """Re-point a persona's entity_url at the canonical base URL.

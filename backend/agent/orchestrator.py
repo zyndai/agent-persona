@@ -165,6 +165,10 @@ def _resolve_action_summary(final_reply: str, actions_taken: list[dict]) -> tupl
     tag_summary, cleaned = _extract_action_summary_tag(final_reply)
     if tag_summary:
         return tag_summary, cleaned
+    # Tags were present but produced no parseable items — still strip them so
+    # raw XML never reaches the frontend.
+    if cleaned != final_reply:
+        return _build_action_summary(actions_taken, final_reply), cleaned
     return _build_action_summary(actions_taken, final_reply), final_reply
 
 
@@ -1668,32 +1672,6 @@ def _capabilities_to_generic_tools() -> list[dict]:
 # Main orchestration loop
 # =====================================================================
 
-_BRIEF_DOC_CACHE: dict[str, tuple[float, str]] = {}
-_BRIEF_DOC_CACHE_TTL_SECONDS = 60
-
-def _fetch_brief_doc_content(user_id: str, doc_id: str) -> str | None:
-    """
-    Fetch the brief Google Doc body, with a short in-process cache so the
-    Docs API isn't hit on every chat turn. Returns None on any failure
-    (caller falls back to persona.description).
-    """
-    import time
-    cached = _BRIEF_DOC_CACHE.get(doc_id)
-    now = time.time()
-    if cached and now - cached[0] < _BRIEF_DOC_CACHE_TTL_SECONDS:
-        return cached[1]
-
-    try:
-        from mcp.tools.google.docs import read_document
-        result = read_document(user_id=user_id, document_id=doc_id)
-        if result.get("success"):
-            content = (result.get("content") or "").strip()
-            _BRIEF_DOC_CACHE[doc_id] = (now, content)
-            return content
-    except Exception as e:
-        print(f"[orchestrator] brief doc fetch failed for {doc_id}: {e}")
-    return None
-
 def _format_user_brief(
     persona: dict,
     redact_profile: bool = False,
@@ -1704,9 +1682,9 @@ def _format_user_brief(
     Render the principal's profile/description as a 'who you serve' briefing.
 
     Source priority:
-      1. The persona's brief Google Doc, if `brief_doc_id` is set, we can
-         fetch it, AND ``redact_brief`` is False. This is the long-form
-         context the user maintains in the dashboard's Brief tab.
+      1. The persona's brief plain-text field (`brief_content`), unless
+         ``redact_brief`` is True. This is the long-form context the user
+         maintains in the dashboard's Brief tab.
       2. Fall back to ``persona.description`` (the short pitch — always
          shareable because it's already on the public registry card).
 
@@ -1716,18 +1694,20 @@ def _format_user_brief(
         Strip profile fields (title, org, location, interests, links).
         Used in external mode when ``can_view_full_profile`` isn't granted.
     redact_brief
-        Skip the brief Google Doc body entirely; the prompt sees only the
-        short ``persona.description``. Used by group dispatch when the
-        asker doesn't have ``can_see_brief`` permission on the group, so
-        the brief body never lands in the LLM's context window for that
-        turn — defense-in-depth, not just a behavioral hint.
-    """
-    brief_doc_id = persona.get("brief_doc_id")
-    doc_content = None
-    if brief_doc_id and user_id and not redact_brief:
-        doc_content = _fetch_brief_doc_content(user_id, brief_doc_id)
+        Skip the brief body entirely; the prompt sees only the short
+        ``persona.description``. Used by group dispatch when the asker
+        doesn't have ``can_see_brief`` permission on the group, so the brief
+        body never lands in the LLM's context window for that turn —
+        defense-in-depth, not just a behavioral hint.
 
-    desc = (doc_content or persona.get("description") or "").strip()
+    ``user_id`` is kept for call-signature compatibility; it is unused now
+    that the brief is a field rather than a Google Doc fetch.
+    """
+    brief_text = None
+    if not redact_brief:
+        brief_text = (persona.get("brief_content") or "").strip()
+
+    desc = (brief_text or persona.get("description") or "").strip()
     profile = persona.get("profile") or {}
 
     lines = []
@@ -2218,6 +2198,8 @@ Two SEPARATE stores. Picking the wrong tool is a hard failure.
 - After `append_to_my_brief`: `✅ Updated your brief.`
 
 NEVER reply "I've added to your Brief" when you called `add_todo`. NEVER claim you did something you didn't do.
+
+**Name changes.** When your principal says their name is wrong or asks to change it — "my name is actually X", "call me X", "change my name to X" — call `update_my_name(name=...)`. Do NOT use `append_to_my_brief` for a name: the name has its own field, and writing it into the Brief instead creates a contradiction you'd then report as "you're A (though your Brief says B)".
 
 ## "What am I doing?" / Status Questions
 When your principal asks about themselves — what they're working on, what's on their plate, what they're up to, what their priorities are, what they're avoiding, etc. — answer in this order:

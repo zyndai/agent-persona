@@ -47,7 +47,7 @@ _REGISTRY_POOL_FLOOR = 60
 # A small TTL cache here turns repeated identical queries into a
 # memory lookup, which is what users typing "founder" → "founders"
 # → "found" → "founder" do all the time.
-_DISCOVER_CACHE: dict[tuple[str, int], tuple[float, dict]] = {}
+_DISCOVER_CACHE: dict[tuple[str, int, str], tuple[float, dict]] = {}
 _DISCOVER_CACHE_LOCK = threading.Lock()
 _DISCOVER_CACHE_TTL = 30.0  # seconds
 
@@ -141,7 +141,7 @@ def _get_avatar_map() -> dict[str, str]:
         _AVATAR_CACHE["global"] = (now + _AVATAR_CACHE_TTL, fresh)
     return fresh
 
-def _discover_cache_get(key: tuple[str, int]) -> dict | None:
+def _discover_cache_get(key: tuple[str, int, str]) -> dict | None:
     with _DISCOVER_CACHE_LOCK:
         hit = _DISCOVER_CACHE.get(key)
         if not hit:
@@ -152,7 +152,7 @@ def _discover_cache_get(key: tuple[str, int]) -> dict | None:
             return None
         return value
 
-def _discover_cache_put(key: tuple[str, int], value: dict) -> None:
+def _discover_cache_put(key: tuple[str, int, str], value: dict) -> None:
     with _DISCOVER_CACHE_LOCK:
         _DISCOVER_CACHE[key] = (time.time() + _DISCOVER_CACHE_TTL, value)
         # Bound the cache size — keep the 64 freshest entries.
@@ -160,6 +160,63 @@ def _discover_cache_put(key: tuple[str, int], value: dict) -> None:
             oldest = sorted(_DISCOVER_CACHE.items(), key=lambda kv: kv[1][0])[: len(_DISCOVER_CACHE) - 64]
             for k, _ in oldest:
                 _DISCOVER_CACHE.pop(k, None)
+
+def _get_connection_counts(agent_ids: list[str]) -> dict[str, int]:
+    """Return accepted connection count per agent_id via two dm_threads queries."""
+    if not agent_ids:
+        return {}
+    try:
+        sb = _get_supabase()
+        id_set = set(agent_ids)
+        counts: dict[str, int] = {aid: 0 for aid in agent_ids}
+
+        for col in ("initiator_id", "receiver_id"):
+            rows = (
+                sb.table("dm_threads")
+                .select(col)
+                .eq("status", "accepted")
+                .in_(col, agent_ids)
+                .execute()
+            )
+            for row in rows.data or []:
+                aid = row.get(col)
+                if aid in id_set:
+                    counts[aid] = counts[aid] + 1
+
+        return counts
+    except Exception as e:
+        logger.warning(f"[discover] connection count query failed: {e}")
+        return {}
+
+def _enrich_discover_results(results: list[dict], user_id: str) -> None:
+    """Mutate results in-place: add connection_count, profile_score, for_you_score."""
+    agent_ids = [p["agent_id"] for p in results if p.get("agent_id")]
+    counts = _get_connection_counts(agent_ids)
+
+    user_match_text = ""
+    if user_id:
+        try:
+            from agent.persona_manager import get_persona_status
+            persona = get_persona_status(user_id)
+            desc = persona.get("description") or ""
+            brief = persona.get("brief_content") or ""
+            user_match_text = f"{desc} {brief}".strip()
+        except Exception:
+            pass
+
+    for p in results:
+        aid = p.get("agent_id") or ""
+        p["connection_count"] = counts.get(aid, 0)
+        p["profile_score"] = sum([
+            bool(p.get("name")),
+            bool(p.get("description")),
+            bool(p.get("avatar_url")),
+        ])
+        if user_match_text:
+            score, _ = _match_score(user_match_text, p.get("name", ""), p.get("description", ""))
+            p["for_you_score"] = score
+        else:
+            p["for_you_score"] = 0
 
 def _discover_local(q: str, top_k: int, avatars: dict[str, str]) -> list[dict]:
     """
@@ -270,7 +327,7 @@ def _discover_registry(q: str, top_k: int, avatars: dict[str, str]) -> list[dict
         })
     return out
 
-def discover_personas(query: str, top_k: int = 20) -> dict:
+def discover_personas(query: str, top_k: int = 20, user_id: str = "") -> dict:
     """
     Local-first people discovery for the dashboard People page.
 
@@ -280,14 +337,18 @@ def discover_personas(query: str, top_k: int = 20) -> dict:
       2. If local results don't fill top_k, supplement with the Zynd registry
          (deduped by agent_id so a persona that's both local and in the registry
          only appears once — with the richer local description).
-      3. 30s in-process cache keyed by (query, top_k) — typing fast no
-         longer slams the DB or the registry.
+      3. Enrich results with connection_count (from dm_threads), profile_score
+         (completeness: name+description+avatar), and for_you_score (keyword
+         overlap with the requesting user's own description/brief).
+      4. 30s in-process cache keyed by (query, top_k, user_id) so per-user
+         enrichment is served correctly without re-hitting the DB.
 
-    Returns: ``{status, count, results: [{name, agent_id, description, avatar_url}],
+    Returns: ``{status, count, results: [{name, agent_id, description, avatar_url,
+               connection_count, profile_score, for_you_score}],
                from_cache, source}``
     """
     q = (query or "").strip()
-    key = (q.lower(), int(top_k))
+    key = (q.lower(), int(top_k), user_id)
 
     cached = _discover_cache_get(key)
     if cached is not None:
@@ -331,6 +392,8 @@ def discover_personas(query: str, top_k: int = 20) -> dict:
             "count": 0,
             "source": "none",
         }
+
+    _enrich_discover_results(results, user_id)
 
     out = {
         "status": "success",

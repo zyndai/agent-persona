@@ -101,6 +101,12 @@ export interface PersonaHit {
    *  scoring (e.g. "matched on: founder, ai") — shown as MatchCard's reason
    *  instead of an arbitrary slice of the description. */
   match_reason?: string;
+  /** Accepted connection count from dm_threads. */
+  connection_count?: number;
+  /** Completeness score: 1pt each for name, description, avatar_url. */
+  profile_score?: number;
+  /** Keyword overlap score between user's own brief/description and this persona. */
+  for_you_score?: number;
 }
 
 export interface ThreadHandoff {

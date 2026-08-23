@@ -3301,7 +3301,7 @@ textarea.input { resize: vertical; min-height: 88px; }
 .people-discover-header {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) minmax(420px, 760px);
-  align-items: end;
+  align-items: center;
   gap: 32px;
   margin-bottom: 18px;
 }
@@ -3656,6 +3656,17 @@ textarea.input { resize: vertical; min-height: 88px; }
 .people-card .avatar {
   flex-shrink: 0;
   border-radius: 10px;
+}
+
+.people-card-link {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+  min-width: 0;
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
 }
 
 .people-card-body {
@@ -4112,12 +4123,15 @@ textarea.input { resize: vertical; min-height: 88px; }
   }
 
   .people-card {
-    display: grid;
-    grid-template-columns: 54px minmax(0, 1fr);
-    align-items: center;
-    column-gap: 12px;
-    row-gap: 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
     padding: 12px;
+  }
+
+  .people-card-link {
+    gap: 12px;
   }
 
   .people-card .avatar,
@@ -4125,6 +4139,7 @@ textarea.input { resize: vertical; min-height: 88px; }
   .people-card-featured .avatar {
     width: 54px;
     height: 54px;
+    flex-shrink: 0;
   }
 
   .people-card-body {
@@ -4132,9 +4147,8 @@ textarea.input { resize: vertical; min-height: 88px; }
   }
 
   .people-card-cta-wrap {
-    grid-column: 2;
     width: 100%;
-    align-self: start;
+    align-self: stretch;
   }
 
   .people-card-cta {

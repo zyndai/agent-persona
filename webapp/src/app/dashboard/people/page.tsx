@@ -54,13 +54,49 @@ type PeopleSectionModel = {
 };
 
 function buildPeopleSections(results: PersonaHit[]): PeopleSectionModel[] {
-  const sections: PeopleSectionModel[] = [
-    { key: "for-you", title: "For you", items: results.slice(0, 4), variant: "featured" },
-    { key: "featured", title: "Featured", items: results.slice(4, 8) },
-    { key: "popular", title: "Popular", items: results.slice(8, 12) },
-    { key: "more", title: "More to meet", items: results.slice(12, 24) },
-  ];
-  return sections.filter((section) => section.items.length > 0);
+  if (results.length === 0) return [];
+
+  const picked = new Set<string>();
+
+  const take = (sorted: PersonaHit[], n: number): PersonaHit[] => {
+    const out: PersonaHit[] = [];
+    for (const p of sorted) {
+      if (!picked.has(p.agent_id)) {
+        picked.add(p.agent_id);
+        out.push(p);
+        if (out.length >= n) break;
+      }
+    }
+    return out;
+  };
+
+  // "For you": profiles with highest keyword overlap against the user's own brief
+  const forYou = take(
+    [...results].sort((a, b) => (b.for_you_score ?? 0) - (a.for_you_score ?? 0)),
+    4,
+  );
+
+  // "Featured": most complete profiles (has name + description + avatar)
+  const featured = take(
+    [...results].sort((a, b) => (b.profile_score ?? 0) - (a.profile_score ?? 0)),
+    4,
+  );
+
+  // "Popular": most connections on the network
+  const popular = take(
+    [...results].sort((a, b) => (b.connection_count ?? 0) - (a.connection_count ?? 0)),
+    4,
+  );
+
+  // "More to meet": everyone else in original relevance order
+  const more = results.filter((p) => !picked.has(p.agent_id));
+
+  return ([
+    { key: "for-you", title: "For you", items: forYou, variant: "featured" as const },
+    { key: "featured", title: "Featured", items: featured },
+    { key: "popular", title: "Popular", items: popular },
+    { key: "more", title: "More to meet", items: more },
+  ] as PeopleSectionModel[]).filter((s) => s.items.length > 0);
 }
 
 function sourceLabel(meta: PeopleDiscoverResponse | null): string {

@@ -56,10 +56,9 @@ async def discover_people(
     scraper, but the response intentionally remains the same compact shape as
     the legacy persona search endpoint.
     """
-    _ = user
     from mcp.tools.zynd_network import discover_personas
 
-    return await asyncio.to_thread(discover_personas, query, limit)
+    return await asyncio.to_thread(discover_personas, query, limit, user["id"])
 
 
 @router.post("/introductions")
